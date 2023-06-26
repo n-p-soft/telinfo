@@ -1,9 +1,9 @@
 /*
  * Linky monitor
- * (c) Nicolas Provost, 08/2022 dev@npsoft.fr
- *
- * License: BSD 3-clause
+ * (c) Nicolas Provost, 2022-2023, dev@npsoft.fr
  * 
+ * License: BSD 3-clause
+ *
  * D3-D9: lcd
  *   NOTE D10 was backlight enable/disable with pull-up.
  *        Was disconnected on lcd board to use D10 as
@@ -11,6 +11,7 @@
  *        the lcd board.
  * UART1: linky output 
  * 
+ * v0.60: add keyboard (on A0)
  * v0.50: initial version
  */
  
@@ -18,7 +19,7 @@
 #include <SoftwareSerial.h>
 #include <avr/pgmspace.h>
 
-#define VERSION "Telinfo v0.50"
+#define VERSION "Telinfo v0.60"
 #define BACKLIGHT_PIN 3
 
 typedef char lcd_line_t[17];
@@ -27,45 +28,40 @@ typedef char lcd_line_t[17];
 typedef enum
 {
   STATE_LCD_ON = 1,
-  STATE_STX = 2, /* got STX */
-  STATE_GI = 4, /* in info group */
 } state_t;
 
-/* data received from Linky */
+/* data received from Linky (tags) */
 typedef enum
 {
-  LD_ERROR = 0,
-  LD_UNKNOWN = 1,
-  LD_ADCO = 2,
-  LD_BASE = 4,
-  LD_MOTDETAT = 8,
+  LD_DATE = 1,
+  LD_HEURE = 2,
+  LD_BASE = 4, /* compteur W */
+  LD_IINST = 8, /* intensite instantanee */
+  LD_IMAX = 0x10, /* intensite max */
+  LD_PAPP = 0x20, /* puissance apparente */
+  LD_ADCO = 0x40, /* addresse compteur */
+  LD_OPTARIF = 0x80, /* option tarifaire */
+  LD_ISOUSC = 0x100, /* intensite souscrite en A */
+  LD_MOTDETAT = 0x200, /* mot d'etat */
+  LD_PTEC = 0x400, /* periode tarifaire en cours */
+  LD_HHPHC = 0x800, /* heures creuses-pleines */
+  LD_END = 0x1000,
+  LD_OK = 0x10000,
+  LD_ERROR = 0x20000,
+  LD_UNKNOWN = 0x40000,
 } linky_field_t;
 
+/* describes one data received */
 typedef struct
 {
   linky_field_t code;
   const char* name;
+  const char* desc;
   const char* unit;
-  int len;
+  char* data;
   int timestamp;
 } linky_def_t;
 
-const linky_def_t fields[] =
-{
-  { LD_BASE, "BASE", "Wh", 9, 0 },
-  { LD_ADCO, "ADCO", "", 12, 0 },
-  { LD_MOTDETAT, "MOTDETAT", "", 6, 0 },
-  { LD_UNKNOWN, NULL, NULL, 0, 0 }
-};
-
-/* Linky data */
-typedef struct linky_data_t 
-{
-  int fields; /* fields that are set below */
-  char base[10];
-  char adco[13];
-  char motdetat[7];
-} linky_data_t;
 
 /* global variables */
 lcd_line_t lcd_line0 = { 0 }; /* lcd line 0 */
@@ -75,9 +71,27 @@ char* line1 = lcd_line1; /* current lcd line 1 */
 int state = 0; /* current program state (state_t) */
 LiquidCrystal lcd (8, 9, 4, 5, 6, 7);  
 int temperature;
-char etiq[9]; /* current tag */
 int chk; /* checksum */
-linky_data_t ldata;
+linky_field_t fields_read;
+
+/* description of received data:
+ */
+linky_def_t fields[] =
+{
+  { LD_DATE, "DATE", "Date", "", "xx/xx/xx", 0 },  
+  { LD_HEURE, "HEURE", "Heure", "", "xx:xx", 0 },
+  { LD_BASE, "BASE", "Index", "Wh", "123456789", 0 },
+  { LD_IINST, "IINST", "I instant.", "A", "123", 0 },
+  { LD_IMAX, "IMAX", "Intensite max","A", "123", 0 },
+  { LD_PAPP, "PAPP", "Puissance app.", "VA", "12345", 0 },
+  { LD_PTEC, "PTEC", "Periode tarif", "", "1234", 0 },
+  { LD_ADCO, "ADCO", "Addresse compt", "", "123456789ABC", 0 },
+  { LD_OPTARIF, "OPTARIF", "Option tarif", "", "1234", 0 },
+  { LD_ISOUSC, "ISOUSC", "I souscrite", "A", "12", 0 },
+  { LD_HHPHC, "HHPHC", "Heures creuses", "", "1", 0 },
+  { LD_MOTDETAT, "MOTDETAT", "Etat", "", "123456", 0 },
+  { LD_END, NULL, NULL, NULL, 0 }
+};
 
 
 /* ====================================================================
@@ -89,12 +103,13 @@ linky_data_t ldata;
 #define btnLEFT 3
 #define btnSELECT 4
 #define btnNONE 5
+#define BUTTONS_CHANNEL 0 /* A0 */
 
 /* read the buttons state on LCD board */
 static uint8_t read_buttons (bool wait_release)
 {
   /* buttons on A0 */
-  /*uint16_t adc_key_in = analogRead (BUTTONS_CHANNEL);
+  uint16_t adc_key_in = analogRead (BUTTONS_CHANNEL);
   uint8_t btn;
   
   if (adc_key_in > 1000)
@@ -117,10 +132,12 @@ static uint8_t read_buttons (bool wait_release)
     while (analogRead (BUTTONS_CHANNEL) < 1000)
     { }
   }
-  return btn;*/
-  return 0;
+  return btn;
 }
 
+/* ====================================================================
+   = LCD                                                              =
+   ==================================================================== */ 
 /* LCD line clear: 0/1/2 for both */
 static void line_clear (int n)
 {
@@ -361,166 +378,113 @@ static int read_byte ()
 
 /* read tag (up to 8 chars) ended with SEP 
  * return LD_xxx */
-static int read_etiq (const linky_def_t** field)
+static linky_field_t read_etiq (linky_def_t** field)
 {
   int i;
   int b;
-  
+  char etiq[10]; /* current tag */
+
   *field = NULL;
-  for (i = 0; i < 9; i++)
+  for (i = 0; ; i++)
   {
     b = read_byte ();
     if (b < 0)
       break;
     chk += b;
-    /*line_print (0, b, 0);
-    line_show (0);
-    delay (700);*/
+    
     if (b == SEP)
     {
-      etiq[i] = 0;
-      for (i = 0; fields[i].name; i++)
+      if (i < 10)
       {
-        if (strcmp (fields[i].name, etiq) == 0)
+        etiq[i] = 0;
+        for (i = 0; fields[i].name; i++)
         {
-          *field = &fields[i];
-          return fields[i].code;
-        }
-      } 
+          if (strcmp (fields[i].name, etiq) == 0)
+          {
+            *field = &fields[i];
+            return fields[i].code;
+          }
+        } 
+      }
+      /*line_clear(0);
+      line_print (0, etiq);
+      line_show (0);
+      delay (700);*/
       return LD_UNKNOWN;
     }
-    else
+    else if (i < 9)
       etiq[i] = b;
   }
   return LD_ERROR;
 }
 
-/* return the field of ldata associated to code */
-static char* field_data (linky_field_t code)
-{
-  switch (code)
-  {
-    case LD_ADCO:
-      return ldata.adco;
-    case LD_BASE:
-      return ldata.base;
-    case LD_MOTDETAT:
-      return ldata.motdetat;
-    default:
-      return NULL;
-  }
-}
-
 /* read the content of the field until SEP */
-static int read_data (const linky_def_t* field)
+static void read_data (linky_def_t* field)
 {
   int i;
   int b;
-  char* p;
-  int maxlen;
-  
+  int maxlen = 15;
+  char* p = NULL;
+
+  /* some fields are not recorded */
   if (field)
-  {
-    maxlen = field->len;
-    p = field_data (field->code);
-  }
-  else
-  {
-    maxlen = 24;
-    p = NULL;
-  }
-  /* read up to maxlen+1 (SEP) chars */
-  for (i = 0; i <= maxlen; i++)
+    p = field->data;
+
+  /* read up to maxlen+1 (including SEP) chars */
+  for (i = 0; ; i++)
   {
     b = read_byte ();
-    if (b < 0)
-      return 0;
     chk += b;
     if (b == SEP)
-    {
-      if (p)
-      {
-        *p = 0;
-        ldata.fields |= field->code;
-      }
-      return 1;
-    }
-    else if (p)
+      break;
+    else if (p && (i < maxlen))
       *p++ = b;
   }
-  return 0;
+  if (p)
+  {
+    *p = 0;
+    fields_read |= field->code;
+  }
 }
 
-/* return 1 if data was read, 0 if no STX, -1 on error */
-static int read_linky ()
+/* return LD_OK if data was read */
+static linky_field_t read_linky ()
 {
   int i;
   int b = 0;
   int lchk;
-  const linky_def_t* field;
+  linky_def_t* field;
 
-  memset (&ldata, 0, sizeof (linky_data_t));
+  fields_read = 0;
 
   /* wait for STX */
   line_print (0, VERSION);
   line_show (0);
-  line_print (1, "...");
+  line_print (1, "waiting");
   line_show (1);
-  state &= ~ (STATE_STX | STATE_GI);
   while (b != STX)
     b = read_byte ();
   line_print (1, "reading");
   line_show (1);
-  state |= STATE_STX;
   while (1)
   {
     b = read_byte ();
     switch (b)
     {
       case ETX:
-        return 1;
-      case EOT:
-        return 0;
+        return LD_OK;
       default:
-        return -1; 
+        return LD_ERROR; 
       case LF: /* start of group of info */
-        if (state & STATE_GI)
-          return -1;
-        state |= STATE_GI;
         chk = 0;
-        if (read_etiq (&field) == LD_ERROR)
-          return -1;
-        if ( ! read_data (field))
-          return -1;
+        read_etiq (&field);
+        read_data (field);
         lchk = read_byte ();
         if (read_byte () != CR)
-          return -1;
-        //if (lchk != ((chk & 0x3f) + 0x20))
-        //  return -1;
-        state -= STATE_GI;
+          return LD_ERROR;
         break;
     }
   };
-}
-
-static int show_linky ()
-{
-  int i;
-  char* p;
-
-  for (i = 0; fields[i].name; i++)
-  {
-    if ( ! (ldata.fields & fields[i].code))
-      continue;
-    p = field_data (fields[i].code);
-    if ((p == NULL) || (*p == 0))
-      continue;
-    line_clear (2);
-    line_print (0, fields[i].name);
-    line_print (1, p);
-    line_show (2);
-    delay (1400);
-  }
 }
 
 /* ==========================================================
@@ -528,15 +492,58 @@ static int show_linky ()
    ========================================================== */
 void loop ()
 {
-  switch (read_linky ())
+  uint8_t buttons;
+  uint8_t do_read = 1; 
+  uint8_t current_field = 0; 
+  char buf[16];
+
+  while(true)
   {
-    case 1:
-      show_linky ();
-      break;
-    case -1:
-      line_print (1, "error");
-      line_show (1);
-      break;
+    if (do_read)
+    {
+      while (read_linky () != LD_OK)
+        delay (250);
+      do_read = 0;
+    }
+
+    /* show current field */
+    line_clear (2);
+    line_print (0, fields[current_field].desc);
+    memset (buf, 0, 16);
+    if (fields_read & fields[current_field].code)
+      strcat (buf, fields[current_field].data);
+    else
+      strcat (buf, "?");
+    strcat (buf, " ");
+    strcat (buf, fields[current_field].unit);
+    line_print (1, buf);
+    line_show (2);
+
+    /* buttons */
+    buttons = read_buttons (true);
+    switch (buttons)
+    {
+      case btnNONE:
+      default:
+        break;
+      case btnSELECT:
+        do_read = 1;
+        break;
+      case btnUP:
+        if (current_field == 0)
+        {
+          while (fields[++current_field].code != LD_END) { };
+        }
+        current_field--;
+        break;
+      case btnDOWN:
+        if (fields[current_field+1].code == LD_END)
+          current_field = 0;
+        else
+          current_field++;
+        break;
+    }
+    
+    delay (250);
   }
-  delay (250);
 }
